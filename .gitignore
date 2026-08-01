@@ -4,3 +4,5 @@
 *.log
 crash.log
 derrick-crash.log
+/staging
+/tools

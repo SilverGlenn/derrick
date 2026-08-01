@@ -13,6 +13,7 @@ mod detect;
 mod settings;
 mod tracker;
 mod tray;
+mod updates;
 
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
@@ -30,6 +31,7 @@ use camera::{CameraEvent, CameraSwitch, spawn_camera};
 use detect::{Detector, INPUT_H, INPUT_W};
 use tracker::{Classifier, Phase, Presence, Tracker, TrackerEvent};
 use tray::{TrayCommand, TrayMsg};
+use updates::{UpdateInfo, UpdateStatus, Phase as UpdatePhase};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -512,7 +514,7 @@ fn open_about(state: &Entity<SergeantState>, app: &mut AsyncApp) {
         return;
     }
 
-    let bounds = app.update(|app| Bounds::centered(None, size(px(380.), px(260.)), app));
+    let bounds = app.update(|app| Bounds::centered(None, size(px(380.), px(480.)), app));
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: None,
@@ -521,7 +523,8 @@ fn open_about(state: &Entity<SergeantState>, app: &mut AsyncApp) {
         show: true,
         ..Default::default()
     };
-    match app.open_window(options, |_, cx| cx.new(|cx| AboutView::new(cx))) {
+    let state_entity = state.clone();
+    match app.open_window(options, |_, cx| cx.new(|cx| AboutView::new(state_entity, cx))) {
         Ok(handle) => {
             log::debug!("opened about window");
             state.update(app, |s, _| s.about_handle = Some(handle));
@@ -1005,12 +1008,53 @@ impl Render for SettingsView {
     }
 }
 
-/// The About window: name, version, repo link, sound attribution.
-struct AboutView;
+/// The About window: identity, repo link, update checking, attribution.
+struct AboutView {
+    state: Entity<SergeantState>,
+    /// Shared with the update worker threads (check/download run on
+    /// plain threads since ureq blocks).
+    updates: Arc<UpdateStatus>,
+    /// Latest release info once a check succeeded, drives the download button.
+    info: Option<UpdateInfo>,
+    /// Cached phase so the poll loop only notifies on change.
+    cached: Option<UpdatePhase>,
+}
 
 impl AboutView {
-    fn new(_cx: &mut Context<Self>) -> Self {
-        Self
+    fn new(state: Entity<SergeantState>, cx: &mut Context<Self>) -> Self {
+        let updates = updates::shared();
+        let poll = updates.clone();
+        // Poll the shared status so the UI updates while a check or download
+        // runs on a worker thread.
+        cx.spawn(async move |this, cx| {
+            let mut cached: Option<UpdatePhase> = None;
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let phase = poll.phase.lock().unwrap().clone();
+                if Some(&phase) != cached.as_ref() {
+                    cached = Some(phase.clone());
+                    let info = match &phase {
+                        UpdatePhase::Checked(Ok(Some(i))) => Some(i.clone()),
+                        _ => None,
+                    };
+                    this.update(cx, |this, cx| {
+                        this.info = info;
+                        this.cached = cached.clone();
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+        Self {
+            state,
+            updates,
+            info: None,
+            cached: None,
+        }
     }
 }
 
@@ -1021,6 +1065,7 @@ impl Render for AboutView {
         let text = rgb(0xcdd6f4);
         let dim = rgb(0x8a8fa3);
         let link = rgb(0x86BCBD);
+        let sage = rgb(0xA4CE8B);
 
         // An inline clickable link (GPUI has no link element).
         let inline_link = |id: &'static str, url: &'static str, label: &'static str| {
@@ -1066,6 +1111,174 @@ impl Render for AboutView {
                 }))
         };
 
+        // A compact action button (sage = primary action, teal = secondary).
+        let action = |id: &'static str, label: &'static str, color: gpui::Rgba| {
+            div()
+                .id(id)
+                .px_3()
+                .py_1p5()
+                .rounded_md()
+                .text_sm()
+                .text_color(color)
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(0x23232e)))
+                .child(label)
+        };
+
+        // A dim status line (no interaction).
+        let status_line = |label: String| {
+            div()
+                .flex()
+                .w_full()
+                .items_center()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(rgb(0x1d1d26))
+                .text_sm()
+                .text_color(dim)
+                .child(label)
+                .into_any_element()
+        };
+
+        // Row: leading text + trailing action button.
+        let row_with_action = |text_el: gpui::AnyElement, button: gpui::AnyElement| {
+            div()
+                .flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(text_el)
+                .child(button)
+                .into_any_element()
+        };
+
+        let phase = self.updates.phase.lock().unwrap().clone();
+
+        // The updates section varies with the phase.
+        let updates_row: gpui::AnyElement = match &phase {
+            UpdatePhase::Idle => {
+                let updates = self.updates.clone();
+                action("about-check", "Check for updates", link)
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        let updates = updates.clone();
+                        *updates.phase.lock().unwrap() = UpdatePhase::Checking;
+                        cx.notify();
+                        std::thread::spawn(move || {
+                            let result = updates::check_for_update();
+                            *updates.phase.lock().unwrap() = UpdatePhase::Checked(result);
+                        });
+                    }))
+                    .into_any_element()
+            }
+            UpdatePhase::Checking => status_line("Checking for updates…".to_string()),
+            UpdatePhase::Checked(Ok(None)) => {
+                let updates = self.updates.clone();
+                let version = env!("CARGO_PKG_VERSION").to_string();
+                row_with_action(
+                    div()
+                        .text_sm()
+                        .text_color(text)
+                        .child(format!("You're on the latest version ({version})"))
+                        .into_any_element(),
+                    action("about-check-again", "Check again", link)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let updates = updates.clone();
+                            *updates.phase.lock().unwrap() = UpdatePhase::Checking;
+                            cx.notify();
+                            std::thread::spawn(move || {
+                                let result = updates::check_for_update();
+                                *updates.phase.lock().unwrap() = UpdatePhase::Checked(result);
+                            });
+                        }))
+                        .into_any_element(),
+                )
+            }
+            UpdatePhase::Checked(Ok(Some(info))) => {
+                let updates = self.updates.clone();
+                let info = info.clone();
+                let size = if info.size > 0 {
+                    format!(" · {:.1} MB", info.size as f64 / 1_000_000.0)
+                } else {
+                    String::new()
+                };
+                row_with_action(
+                    div()
+                        .text_sm()
+                        .text_color(text)
+                        .child(format!("Version {} is available{}", info.version, size))
+                        .into_any_element(),
+                    action("about-download", "Download & install", sage)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let updates = updates.clone();
+                            let info = info.clone();
+                            cx.notify();
+                            std::thread::spawn(move || {
+                                let _ = updates::download(&info, &updates);
+                            });
+                        }))
+                        .into_any_element(),
+                )
+            }
+            UpdatePhase::Checked(Err(err)) => {
+                let updates = self.updates.clone();
+                row_with_action(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0xBA5A5A))
+                        .child(format!("Couldn't reach GitHub ({err})"))
+                        .into_any_element(),
+                    action("about-retry", "Try again", link)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let updates = updates.clone();
+                            *updates.phase.lock().unwrap() = UpdatePhase::Checking;
+                            cx.notify();
+                            std::thread::spawn(move || {
+                                let result = updates::check_for_update();
+                                *updates.phase.lock().unwrap() = UpdatePhase::Checked(result);
+                            });
+                        }))
+                        .into_any_element(),
+                )
+            }
+            UpdatePhase::Downloading { done, total } => {
+                let pct = if *total > 0 {
+                    done * 100 / total
+                } else {
+                    0
+                };
+                status_line(format!("Downloading… {pct}%"))
+            }
+            UpdatePhase::Downloaded => {
+                let updates = self.updates.clone();
+                let state = self.state.clone();
+                row_with_action(
+                    div().text_sm().text_color(text).child("Update ready").into_any_element(),
+                    action("about-install", "Install & restart", sage)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let updates = updates.clone();
+                            let msi = updates.download_dest.lock().unwrap().clone();
+                            if let Some(msi) = msi {
+                                *updates.phase.lock().unwrap() = UpdatePhase::Installing;
+                                match updates::launch_updater(&msi) {
+                                    Ok(()) => {
+                                        state.update(cx, |s, _| s.should_quit = true);
+                                    }
+                                    Err(e) => {
+                                        *updates.phase.lock().unwrap() =
+                                            UpdatePhase::Checked(Err(e));
+                                    }
+                                }
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                )
+            }
+            UpdatePhase::Installing => status_line("Installing — Derrick will restart".to_string()),
+        };
+
         div()
             .size_full()
             .bg(bg)
@@ -1073,7 +1286,7 @@ impl Render for AboutView {
             .flex()
             .flex_col()
             .p_4()
-            .gap_4()
+            .gap_3()
             .child(
                 div()
                     .flex()
@@ -1127,6 +1340,22 @@ impl Render for AboutView {
             )
             // Repo link.
             .child(link_row("about-github", GITHUB_URL, "GitHub repository"))
+            // Updates: check, download, install.
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(dim)
+                            .child("UPDATES"),
+                    )
+                    .child(updates_row),
+            )
             .child(div().w_full().h(px(1.)).bg(rgb(0x2a2a3a)))
             // Attribution as a single flowing line with inline links.
             .child(
@@ -1807,6 +2036,35 @@ fn play_alarm() {
 
 fn main() {
     env_logger::init();
+
+    // Test hooks for the update pipeline (see README).
+    if std::env::var_os("SERGEANT_TEST_UPDATES").is_some() {
+        std::thread::spawn(|| {
+            match updates::fetch_latest() {
+                Ok(info) => log::info!("update test: latest release is {}", info.version),
+                Err(e) => log::info!("update test: fetch failed: {e}"),
+            }
+            if std::env::var_os("SERGEANT_TEST_FORCE_UPDATE").is_some() {
+                match updates::fetch_latest() {
+                    Ok(info) => {
+                        log::info!("update test: downloading {}", info.asset_name);
+                        let status = updates::shared();
+                        match updates::download(&info, &status) {
+                            Ok(msi) => match updates::launch_updater(&msi) {
+                                Ok(()) => {
+                                    log::info!("update test: updater launched, exiting");
+                                    std::process::exit(0);
+                                }
+                                Err(e) => log::error!("update test: updater failed: {e}"),
+                            },
+                            Err(e) => log::error!("update test: download failed: {e}"),
+                        }
+                    }
+                    Err(e) => log::error!("update test: fetch failed: {e}"),
+                }
+            }
+        });
+    }
 
     // `--selftest <image>`: run the detector on a still image and print results,
     // then exit. Handy for verifying the model + decode pipeline without a camera.

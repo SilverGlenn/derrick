@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Derrick installer (per-user, no admin required).
+  Product version is bound to the exe's FILEVERSION resource, so bumping
+  Cargo.toml version is all that's needed before building a new MSI.
+  The UpgradeCode below must NEVER change.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="Derrick"
+           Language="1033"
+           Version="!(bind.FileVersion.derrickExe)"
+           Manufacturer="SilverGlenn"
+           UpgradeCode="2E5C5D43-9B1A-4E7A-8C2F-6D4A3B9E1F07">
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perUser"
+             Description="Derrick — your desk sentinel"
+             Comments="Enforces a work/standing-break cycle from the system tray." />
+
+    <!-- Upgrades replace any earlier version cleanly. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Derrick is already installed." />
+
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- Minimal progress UI when installed by double-click. -->
+    <UIRef Id="WixUI_Minimal" />
+
+    <Icon Id="app.ico" SourceFile="..\assets\app.ico" />
+    <Property Id="ARPPRODUCTICON" Value="app.ico" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="INSTALLFOLDER" Name="Derrick">
+          <Component Id="MainFiles" Guid="5E58DCDA-BB21-456C-B86A-32232489D51B">
+            <File Id="derrickExe" Name="derrick.exe" Source="..\target\release\derrick.exe" />
+            <File Id="directmlDll" Name="DirectML.dll" Source="..\target\release\DirectML.dll" />
+            <RegistryValue Root="HKCU"
+                           Key="Software\SilverGlenn\Derrick"
+                           Name="installed"
+                           Type="integer"
+                           Value="1"
+                           KeyPath="yes" />
+            <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+          </Component>
+          <Directory Id="AssetsFolder" Name="assets">
+            <Component Id="Assets" Guid="E0F35608-C246-4220-9502-1A67FDF88C64">
+              <File Id="yunetModel"
+                    Name="face_detection_yunet_2026may.onnx"
+                    Source="..\assets\face_detection_yunet_2026may.onnx" />
+              <RegistryValue Root="HKCU"
+                             Key="Software\SilverGlenn\Derrick"
+                             Name="model"
+                             Type="integer"
+                             Value="1"
+                             KeyPath="yes" />
+              <RemoveFolder Id="RemoveAssetsFolder" On="uninstall" />
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ProgramMenuDir" Name="Derrick">
+          <Component Id="StartMenuShortcut" Guid="*">
+            <Shortcut Id="DerrickShortcut"
+                      Name="Derrick"
+                      Description="Derrick — your desk sentinel"
+                      Target="[INSTALLFOLDER]derrick.exe"
+                      WorkingDirectory="INSTALLFOLDER" />
+            <RemoveFolder Id="RemoveProgramMenuDir" On="uninstall" />
+            <RegistryValue Root="HKCU"
+                           Key="Software\SilverGlenn\Derrick"
+                           Name="shortcut"
+                           Type="integer"
+                           Value="1"
+                           KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="MainFeature" Title="Derrick" Level="1">
+      <ComponentRef Id="MainFiles" />
+      <ComponentRef Id="Assets" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Product>
+</Wix>
