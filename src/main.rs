@@ -34,7 +34,7 @@ use tray::{TrayCommand, TrayMsg};
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Project repository — replace with the real URL once the repo exists.
-const GITHUB_URL: &str = "https://github.com/yourname/derrick";
+const GITHUB_URL: &str = "https://github.com/SilverGlenn/derrick";
 
 
 
