@@ -1,0 +1,6 @@
+/target
+/dist
+*.zip
+*.log
+crash.log
+derrick-crash.log

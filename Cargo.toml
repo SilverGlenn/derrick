@@ -1,0 +1,31 @@
+[package]
+name = "derrick"
+version = "0.1.0"
+edition = "2021"
+description = "GPUI desk sentinel: forces you to stand up for 5 minutes every 30"
+license = "MIT"
+build = "build.rs"
+
+[build-dependencies]
+winresource = "0.1"
+
+[dependencies]
+anyhow = "1"
+env_logger = "0.11"
+gpui = { git = "https://github.com/gpui-ce/gpui-ce", rev = "33ed975", package = "gpui" }
+gpui_platform = { git = "https://github.com/gpui-ce/gpui-ce", rev = "33ed975" }
+image = { version = "0.25", default-features = false, features = ["png"] }
+log = "0.4"
+nokhwa = { version = "0.10", features = ["input-msmf", "decoding"] }
+ort = { version = "2.0.0-rc.13", features = ["download-binaries", "copy-dylibs"] }
+serde = { version = "1", features = ["derive"] }
+smallvec = "1.6"
+toml = "0.8"
+tray-icon = "0.24"
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_Registry", "Win32_Media_Audio"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
