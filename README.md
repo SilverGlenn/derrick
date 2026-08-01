@@ -45,7 +45,15 @@ to stand up**.
 - Camera privacy setting must allow desktop apps (Windows Settings →
   Privacy → Camera)
 
-## Build
+## Releases & updates
+
+- **Build the MSI:** `build_msi.cmd` → `dist\Derrick-<version>.msi` (WiX 3.14, downloaded to `tools\` on first run; per-user install, no admin).
+- **Publish:** `gh release create v<version> dist\Derrick-<version>.msi --title "Derrick v<version>"`.
+- **In-app updates:** the About window's *Check for updates* reads the GitHub Releases API (via curl.exe — see below), downloads the MSI, and silently reinstalls + relaunches.
+- The updater keeps `%APPDATA%\Derrick\config.toml` intact.
+
+> Note: HTTP goes through `curl.exe` (bundled with Windows 10 1803+) because some AV products block sockets from unsigned exes like derrick.exe itself.
+
 
 ```sh
 cargo build --release
