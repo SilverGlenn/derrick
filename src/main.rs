@@ -1011,13 +1011,11 @@ impl Render for SettingsView {
 /// The About window: identity, repo link, update checking, attribution.
 struct AboutView {
     state: Entity<SergeantState>,
-    /// Shared with the update worker threads (check/download run on
-    /// plain threads since ureq blocks).
+    /// Shared with the update worker threads (check/download run on plain
+    /// threads because the HTTP calls are blocking).
     updates: Arc<UpdateStatus>,
     /// Latest release info once a check succeeded, drives the download button.
     info: Option<UpdateInfo>,
-    /// Cached phase so the poll loop only notifies on change.
-    cached: Option<UpdatePhase>,
 }
 
 impl AboutView {
@@ -1025,14 +1023,14 @@ impl AboutView {
         let updates = updates::shared();
         let poll = updates.clone();
         // Poll the shared status so the UI updates while a check or download
-        // runs on a worker thread.
+        // runs on a worker thread. Only notify when the phase changes.
         cx.spawn(async move |this, cx| {
             let mut cached: Option<UpdatePhase> = None;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(300))
                     .await;
-                let phase = poll.phase.lock().unwrap().clone();
+                let phase = poll.phase();
                 if Some(&phase) != cached.as_ref() {
                     cached = Some(phase.clone());
                     let info = match &phase {
@@ -1041,7 +1039,6 @@ impl AboutView {
                     };
                     this.update(cx, |this, cx| {
                         this.info = info;
-                        this.cached = cached.clone();
                         cx.notify();
                     })
                     .ok();
@@ -1053,7 +1050,39 @@ impl AboutView {
             state,
             updates,
             info: None,
-            cached: None,
+        }
+    }
+
+    /// Kick off an update check on a worker thread (curl is blocking).
+    fn start_check(&self) {
+        let updates = self.updates.clone();
+        updates.set_phase(UpdatePhase::Checking);
+        std::thread::spawn(move || {
+            let result = updates::check_for_update();
+            updates.set_phase(UpdatePhase::Checked(result));
+        });
+    }
+
+    /// Kick off a download on a worker thread.
+    fn start_download(&self, info: UpdateInfo) {
+        let updates = self.updates.clone();
+        std::thread::spawn(move || {
+            let _ = updates::download(&info, &updates);
+        });
+    }
+
+    /// Install the downloaded MSI and quit; the updater relaunches the app.
+    fn install_ready(&self, cx: &mut Context<Self>) {
+        let updates = self.updates.clone();
+        let state = self.state.clone();
+        if let Some(msi) = updates.download_dest() {
+            updates.set_phase(UpdatePhase::Installing);
+            match updates::launch_updater(&msi) {
+                Ok(()) => {
+                    state.update(cx, |s, _| s.should_quit = true);
+                }
+                Err(e) => updates.set_phase(UpdatePhase::Checked(Err(e))),
+            }
         }
     }
 }
@@ -1154,27 +1183,20 @@ impl Render for AboutView {
                 .into_any_element()
         };
 
-        let phase = self.updates.phase.lock().unwrap().clone();
+        let phase = self.updates.phase();
 
         // The updates section varies with the phase.
         let updates_row: gpui::AnyElement = match &phase {
             UpdatePhase::Idle => {
-                let updates = self.updates.clone();
                 action("about-check", "Check for updates", link)
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        let updates = updates.clone();
-                        *updates.phase.lock().unwrap() = UpdatePhase::Checking;
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.start_check();
                         cx.notify();
-                        std::thread::spawn(move || {
-                            let result = updates::check_for_update();
-                            *updates.phase.lock().unwrap() = UpdatePhase::Checked(result);
-                        });
                     }))
                     .into_any_element()
             }
             UpdatePhase::Checking => status_line("Checking for updates…".to_string()),
             UpdatePhase::Checked(Ok(None)) => {
-                let updates = self.updates.clone();
                 let version = env!("CARGO_PKG_VERSION").to_string();
                 row_with_action(
                     div()
@@ -1183,20 +1205,14 @@ impl Render for AboutView {
                         .child(format!("You're on the latest version ({version})"))
                         .into_any_element(),
                     action("about-check-again", "Check again", link)
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            let updates = updates.clone();
-                            *updates.phase.lock().unwrap() = UpdatePhase::Checking;
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.start_check();
                             cx.notify();
-                            std::thread::spawn(move || {
-                                let result = updates::check_for_update();
-                                *updates.phase.lock().unwrap() = UpdatePhase::Checked(result);
-                            });
                         }))
                         .into_any_element(),
                 )
             }
             UpdatePhase::Checked(Ok(Some(info))) => {
-                let updates = self.updates.clone();
                 let info = info.clone();
                 let size = if info.size > 0 {
                     format!(" · {:.1} MB", info.size as f64 / 1_000_000.0)
@@ -1210,19 +1226,15 @@ impl Render for AboutView {
                         .child(format!("Version {} is available{}", info.version, size))
                         .into_any_element(),
                     action("about-download", "Download & install", sage)
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            let updates = updates.clone();
+                        .on_click(cx.listener(move |this, _, _, cx| {
                             let info = info.clone();
+                            this.start_download(info);
                             cx.notify();
-                            std::thread::spawn(move || {
-                                let _ = updates::download(&info, &updates);
-                            });
                         }))
                         .into_any_element(),
                 )
             }
             UpdatePhase::Checked(Err(err)) => {
-                let updates = self.updates.clone();
                 row_with_action(
                     div()
                         .text_sm()
@@ -1230,14 +1242,9 @@ impl Render for AboutView {
                         .child(format!("Couldn't reach GitHub ({err})"))
                         .into_any_element(),
                     action("about-retry", "Try again", link)
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            let updates = updates.clone();
-                            *updates.phase.lock().unwrap() = UpdatePhase::Checking;
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.start_check();
                             cx.notify();
-                            std::thread::spawn(move || {
-                                let result = updates::check_for_update();
-                                *updates.phase.lock().unwrap() = UpdatePhase::Checked(result);
-                            });
                         }))
                         .into_any_element(),
                 )
@@ -1251,26 +1258,11 @@ impl Render for AboutView {
                 status_line(format!("Downloading… {pct}%"))
             }
             UpdatePhase::Downloaded => {
-                let updates = self.updates.clone();
-                let state = self.state.clone();
                 row_with_action(
                     div().text_sm().text_color(text).child("Update ready").into_any_element(),
                     action("about-install", "Install & restart", sage)
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            let updates = updates.clone();
-                            let msi = updates.download_dest.lock().unwrap().clone();
-                            if let Some(msi) = msi {
-                                *updates.phase.lock().unwrap() = UpdatePhase::Installing;
-                                match updates::launch_updater(&msi) {
-                                    Ok(()) => {
-                                        state.update(cx, |s, _| s.should_quit = true);
-                                    }
-                                    Err(e) => {
-                                        *updates.phase.lock().unwrap() =
-                                            UpdatePhase::Checked(Err(e));
-                                    }
-                                }
-                            }
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.install_ready(cx);
                             cx.notify();
                         }))
                         .into_any_element(),

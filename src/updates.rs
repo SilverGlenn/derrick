@@ -32,9 +32,41 @@ pub struct UpdateInfo {
 }
 
 pub struct UpdateStatus {
-    pub phase: Mutex<Phase>,
-    /// The downloaded MSI, set when the download finishes.
-    pub download_dest: Mutex<Option<PathBuf>>,
+    phase: Mutex<Phase>,
+    download_dest: Mutex<Option<PathBuf>>,
+}
+
+impl UpdateStatus {
+    /// Read the current phase without panicking on a poisoned lock.
+    pub fn phase(&self) -> Phase {
+        self.phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Replace the current phase without panicking on a poisoned lock.
+    pub fn set_phase(&self, phase: Phase) {
+        *self
+            .phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = phase;
+    }
+
+    /// The downloaded MSI, if a download finished.
+    pub fn download_dest(&self) -> Option<PathBuf> {
+        self.download_dest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn set_download_dest(&self, dest: PathBuf) {
+        *self
+            .download_dest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(dest);
+    }
 }
 
 impl Default for UpdateStatus {
@@ -140,14 +172,14 @@ fn parse_version(v: &str) -> (u32, u32, u32) {
 
 /// Record a failure in the shared status and return the message.
 fn fail(status: &UpdateStatus, msg: String) -> String {
-    *status.phase.lock().unwrap() = Phase::Checked(Err(msg.clone()));
+    status.set_phase(Phase::Checked(Err(msg.clone())));
     msg
 }
 
 /// Blocking call — run on a worker thread. Downloads the asset to the
 /// updates folder, reporting progress through `status` as it goes.
 pub fn download(info: &UpdateInfo, status: &UpdateStatus) -> Result<PathBuf, String> {
-    *status.phase.lock().unwrap() = Phase::Downloading { done: 0, total: 0 };
+    status.set_phase(Phase::Downloading { done: 0, total: 0 });
 
     let dir = updates_dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -183,10 +215,10 @@ pub fn download(info: &UpdateInfo, status: &UpdateStatus) -> Result<PathBuf, Str
             return Err(fail(status, format!("can't write file ({e})")));
         }
         written += n as u64;
-        *status.phase.lock().unwrap() = Phase::Downloading {
+        status.set_phase(Phase::Downloading {
             done: written,
             total: size,
-        };
+        });
     }
 
     match child.wait() {
@@ -204,8 +236,8 @@ pub fn download(info: &UpdateInfo, status: &UpdateStatus) -> Result<PathBuf, Str
         }
     }
 
-    *status.phase.lock().unwrap() = Phase::Downloaded;
-    *status.download_dest.lock().unwrap() = Some(dest.clone());
+    status.set_phase(Phase::Downloaded);
+    status.set_download_dest(dest.clone());
     Ok(dest)
 }
 
