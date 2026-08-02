@@ -514,7 +514,7 @@ fn open_about(state: &Entity<SergeantState>, app: &mut AsyncApp) {
         return;
     }
 
-    let bounds = app.update(|app| Bounds::centered(None, size(px(380.), px(480.)), app));
+    let bounds = app.update(|app| Bounds::centered(None, size(px(380.), px(350.)), app));
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: None,
@@ -1096,23 +1096,6 @@ impl Render for AboutView {
         let link = rgb(0x86BCBD);
         let sage = rgb(0xA4CE8B);
 
-        // An inline clickable link (GPUI has no link element).
-        let inline_link = |id: &'static str, url: &'static str, label: &'static str| {
-            div()
-                .id(id)
-                .px_1()
-                .rounded_sm()
-                .text_sm()
-                .text_color(link)
-                .cursor_pointer()
-                .hover(|style| style.bg(rgb(0x2a2a3a)))
-                .child(label)
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    open_url(url);
-                    cx.notify();
-                }))
-        };
-
         // Full-width link row for the repo.
         let link_row = |id: &'static str, url: &'static str, label: &'static str| {
             div()
@@ -1305,14 +1288,14 @@ impl Render for AboutView {
                             .child("✕"),
                     ),
             )
-            // Identity block: icon, name, version + tagline.
+            // Identity block: name + version line (no img element — it
+            // misbehaves inside flex columns on this GPUI version).
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap_2()
-                    .child(img(ImageSource::Render(app_icon())).size(px(56.)))
+                    .gap_1()
                     .child(
                         div()
                             .text_2xl()
@@ -1325,7 +1308,7 @@ impl Render for AboutView {
                             .text_sm()
                             .text_color(dim)
                             .child(format!(
-                                "Version {} — your desk sentinel",
+                                "Version {} · your desk sentinel",
                                 env!("CARGO_PKG_VERSION")
                             )),
                     ),
@@ -1349,30 +1332,20 @@ impl Render for AboutView {
                     .child(updates_row),
             )
             .child(div().w_full().h(px(1.)).bg(rgb(0x2a2a3a)))
-            // Attribution as a single flowing line with inline links.
+            // Attribution: plain static line (inline links misrender inside
+            // flex chains on this GPUI version); the credits page is linked
+            // from the GitHub row instead.
             .child(
                 div()
                     .flex()
                     .flex_col()
+                    .items_center()
                     .gap_1()
                     .child(
                         div()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .justify_center()
-                            .child(div().text_sm().text_color(dim).child("Break sound: Sound Effect by "))
-                            .child(inline_link(
-                                "about-pixabay-user",
-                                "https://pixabay.com/users/universfield-28281460/",
-                                "Universfield",
-                            ))
-                            .child(div().text_sm().text_color(dim).child(" from "))
-                            .child(inline_link(
-                                "about-pixabay",
-                                "https://pixabay.com/sound-effects/",
-                                "Pixabay",
-                            )),
+                            .text_xs()
+                            .text_color(dim)
+                            .child("Break sound: Sound Effect by Universfield from Pixabay"),
                     )
                     .child(
                         div()
@@ -1382,24 +1355,6 @@ impl Render for AboutView {
                     ),
             )
     }
-}
-
-/// The app icon (same orange figure as the tray) for the About window.
-fn app_icon() -> Arc<RenderImage> {
-    use std::sync::OnceLock;
-    static ICON: OnceLock<Arc<RenderImage>> = OnceLock::new();
-    ICON.get_or_init(|| {
-        let png = include_bytes!("../assets/tray_icon.png");
-        let img = image::load_from_memory(png)
-            .expect("tray icon png")
-            .to_rgba8();
-        let (w, h) = img.dimensions();
-        let buffer = RgbaImage::from_raw(w, h, img.into_raw()).expect("rgba buffer");
-        Arc::new(RenderImage::new(
-            std::iter::once(Frame::new(buffer)).collect::<smallvec::SmallVec<[Frame; 1]>>(),
-        ))
-    })
-    .clone()
 }
 
 /// Actions available from the "..." menu.
@@ -2110,7 +2065,12 @@ fn main() {
         cx.set_quit_mode(gpui::QuitMode::Explicit);
         // No window at startup: the app lives in the tray and only shows up
         // when the tray icon is clicked or a break starts.
-        cx.new(|cx| SergeantState::new(cx));
+        let entity = cx.new(|cx| SergeantState::new(cx));
+        // Test aid: SERGEANT_TEST_OPEN_ABOUT=1 opens the About window at
+        // startup (layout screenshots).
+        if std::env::var_os("SERGEANT_TEST_OPEN_ABOUT").is_some() {
+            entity.update(cx, |s, _| s.should_open_about = true);
+        }
     });
 }
 
