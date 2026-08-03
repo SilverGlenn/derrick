@@ -1,6 +1,6 @@
 [package]
 name = "derrick"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "GPUI desk sentinel: forces you to stand up for 5 minutes every 30"
 license = "MIT"
