@@ -34,6 +34,10 @@ use tray::{TrayCommand, TrayMsg};
 use updates::{UpdateInfo, UpdateStatus, Phase as UpdatePhase};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
+/// How long each work-phase presence check keeps the camera on when the user
+/// is sitting (long enough for several detections + the debounce). While the
+/// user is standing it stays on until they sit back down.
+const CHECK_WINDOW: Duration = Duration::from_secs(6);
 
 /// Project repository — replace with the real URL once the repo exists.
 const GITHUB_URL: &str = "https://github.com/SilverGlenn/derrick";
@@ -59,6 +63,15 @@ struct SergeantState {
     camera_switch: CameraSwitch,
     /// Mirror of the switch, so the UI knows the camera is on without poking atomics.
     camera_on: bool,
+    /// Cadence of work-phase presence checks (env SERGEANT_CHECK_MINUTES,
+    /// default 2 minutes).
+    work_check_interval: Duration,
+    /// While set, the camera is on for a work check; cleared when the check
+    /// ends (sitting detected) or the phase leaves Working.
+    check_until: Option<Instant>,
+    /// When the last check ended (None = not armed; the first check fires a
+    /// full interval after clock-in / calibration).
+    last_work_check: Option<Instant>,
     camera_ok: bool,
     last_face_score: Option<f32>,
     status: String,
@@ -137,6 +150,9 @@ impl SergeantState {
             preview: None,
             camera_switch,
             camera_on: true,
+            work_check_interval: env_check_minutes(),
+            check_until: None,
+            last_work_check: None,
             camera_ok: true,
             last_face_score: None,
             status: String::new(),
@@ -282,9 +298,44 @@ impl SergeantState {
             }
         }
 
+        // Work-phase presence checks (check-and-hold): every interval the
+        // camera turns on briefly; if the user is standing it stays on,
+        // crediting real standing time toward the next break, and turns off
+        // once they sit again. Manual pause suspends the checks.
+        let now = Instant::now();
+        if self.tracker.phase == Phase::Working && !self.tracker.paused {
+            match self.last_work_check {
+                None => self.last_work_check = Some(now),
+                Some(t)
+                    if now.duration_since(t) >= self.work_check_interval
+                        && self.check_until.is_none() =>
+                {
+                    log::debug!(
+                        "work check: camera on (presence={:?})",
+                        self.classifier.presence
+                    );
+                    self.check_until = Some(now + CHECK_WINDOW);
+                }
+                _ => {}
+            }
+            if let Some(until) = self.check_until {
+                if now >= until && self.classifier.presence == Presence::Sitting {
+                    self.check_until = None;
+                    self.last_work_check = Some(now);
+                    log::debug!("work check: camera off (sitting)");
+                }
+            }
+        } else {
+            self.last_work_check = None;
+            self.check_until = None;
+        }
+
         // Camera policy: on for calibration (startup + after each break, so the
-        // sitting baseline stays fresh) and during breaks. Off during work.
-        let want_camera = self.tracker.phase == Phase::Break || !self.classifier.is_calibrated();
+        // sitting baseline stays fresh), during breaks, and during work checks.
+        // Off otherwise.
+        let want_camera = self.tracker.phase == Phase::Break
+            || !self.classifier.is_calibrated()
+            || self.check_until.is_some();
         if want_camera != self.camera_on {
             self.camera_on = want_camera;
             self.camera_switch.set(want_camera);
@@ -302,7 +353,10 @@ impl SergeantState {
 
         // If the camera is down (or off) we cannot verify anything: treat the
         // user as sitting so the break timer does not run on a dead camera.
-        let presence = if self.camera_on && self.camera_ok {
+        // (SERGEANT_TEST_STANDING=1 fakes "standing" for headless E2E runs.)
+        let presence = if std::env::var_os("SERGEANT_TEST_STANDING").is_some() {
+            Presence::Standing
+        } else if self.camera_on && self.camera_ok {
             self.classifier.presence
         } else {
             Presence::Sitting
@@ -322,6 +376,10 @@ impl SergeantState {
                     // Re-learn the sitting baseline while the user settles in.
                     self.classifier.recalibrate();
                 }
+                TrackerEvent::BreakSkipped => {
+                    log::info!("event: BREAK SKIPPED (standing credit covered it)");
+                    self.set_status("Break covered — you already stood enough!");
+                }
             }
         }
 
@@ -337,7 +395,7 @@ impl SergeantState {
             "Idle — click Clock in to start".to_string()
         } else if self.tracker.phase == Phase::Break {
             let a = self.tracker.break_accumulated;
-            let n = self.tracker.break_needed;
+            let n = self.tracker.break_requirement;
             format!(
                 "STAND UP! break {:02}:{:02} / {:02}:{:02}",
                 a.as_secs() / 60,
@@ -590,7 +648,7 @@ struct SergeantView {
     /// Whether the "..." menu is open.
     menu_open: bool,
     /// When set, the Clock out row is armed and needs a second click.
-    confirm_clockout_until: Option<Instant>,
+    confirm_clockout: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -623,7 +681,7 @@ impl SergeantView {
             state,
             pending,
             menu_open: false,
-            confirm_clockout_until: None,
+            confirm_clockout: false,
         }
     }
 }
@@ -666,7 +724,7 @@ impl Render for SergeantView {
             }
             Phase::Break => {
                 let a = state.tracker.break_accumulated;
-                let n = state.tracker.break_needed;
+                let n = state.tracker.break_requirement;
                 (
                     rgb(0xF7E49B),
                     format!(
@@ -734,7 +792,7 @@ impl Render for SergeantView {
                     div()
                         .text_sm()
                         .text_color(dim)
-                        .child("Camera turns on at break time"),
+                        .child("Camera blips during work · on for breaks"),
                 )
                 .into_any_element(),
         };
@@ -760,12 +818,9 @@ impl Render for SergeantView {
         // Everything else lives in the "..." menu.
         let menu_open = self.menu_open;
         let phase = state.tracker.phase;
-        let confirming_clockout = self
-            .confirm_clockout_until
-            .is_some_and(|t| Instant::now() < t);
-        if !confirming_clockout {
-            self.confirm_clockout_until = None;
-        }
+        // Once armed, the clock-out confirmation stays until confirmed,
+        // cancelled, or the menu closes (no silent expiry).
+        let confirming_clockout = self.confirm_clockout;
 
         div()
             .size_full()
@@ -898,7 +953,7 @@ impl Render for SergeantView {
                         .bottom_0()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.menu_open = false;
-                            this.confirm_clockout_until = None;
+                            this.confirm_clockout = false;
                             cx.notify();
                         })),
                 )
@@ -1364,6 +1419,7 @@ enum MenuAction {
     Recalibrate,
     ResetWork,
     ClockOut,
+    CancelClockOut,
     Settings,
     About,
     Quit,
@@ -1397,8 +1453,8 @@ fn menu_row(
             el.on_click(cx.listener(move |this, _, _, cx| {
                 // Clock out needs a second, confirming click. Every other row
                 // (and this row's first click) resets the confirmation.
-                let confirming = this.confirm_clockout_until.is_some();
-                this.confirm_clockout_until = None;
+                let confirming = this.confirm_clockout;
+                this.confirm_clockout = false;
                 this.menu_open = false;
                 match action {
                     MenuAction::SkipBreak => {
@@ -1414,11 +1470,14 @@ fn menu_row(
                         if confirming {
                             this.state.update(cx, |s, state_cx| s.clock_out(state_cx));
                         } else {
-                            // First click arms the confirmation; keep the menu open.
+                            // First click arms the confirmation; keep the menu
+                            // open until confirmed or cancelled.
                             this.menu_open = true;
-                            this.confirm_clockout_until =
-                                Some(Instant::now() + Duration::from_secs(4));
+                            this.confirm_clockout = true;
                         }
+                    }
+                    MenuAction::CancelClockOut => {
+                        // Confirmation already cleared above; close the menu.
                     }
                     MenuAction::Settings => {
                         this.state.update(cx, |s, _| s.should_open_settings = true)
@@ -1472,11 +1531,18 @@ fn menu_panel(
     items.push(menu_row("m-settings", "Settings", false, false, MenuAction::Settings, cx).into_any_element());
     items.push(menu_separator().into_any_element());
     if !idle {
-        // Clock out only exists while clocked in.
+        // Clock out only exists while clocked in. When the confirmation is
+        // armed, offer an explicit escape hatch alongside it.
         items.push(
             menu_row("m-clockout", clockout_label, false, true, MenuAction::ClockOut, cx)
                 .into_any_element(),
         );
+        if confirming_clockout {
+            items.push(
+                menu_row("m-cancel", "Keep working", false, false, MenuAction::CancelClockOut, cx)
+                    .into_any_element(),
+            );
+        }
     }
     items.push(menu_row("m-about", "About", false, false, MenuAction::About, cx).into_any_element());
     items.push(menu_row("m-quit", "Quit", false, false, MenuAction::Quit, cx).into_any_element());
@@ -1929,7 +1995,17 @@ fn format_date(days: i64) -> String {
     )
 }
 
+/// Read the work-check cadence from the environment (fractional minutes).
+fn env_check_minutes() -> Duration {
+    let minutes = std::env::var("SERGEANT_CHECK_MINUTES")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(2.0);
+    Duration::from_secs_f64(minutes.max(0.5) * 60.0)
+}
+
 #[cfg(test)]
+
 mod date_tests {
     #[test]
     fn civil_date_known_values() {

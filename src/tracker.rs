@@ -22,18 +22,31 @@ pub enum Phase {
     Break,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrackerEvent {
     BreakStarted,
     BreakCompleted,
+    /// The work block finished but voluntary standing already covered the
+    /// required break time — the break was skipped.
+    BreakSkipped,
 }
 
 /// Work/break timer. During a break, the countdown only advances while the
-/// user is NOT sitting at their desk.
+/// user is NOT sitting at their desk. During work, voluntary standing time
+/// accrues as credit toward the next break (a stand of 3 minutes means the
+/// break only needs 2 more); if the credit covers the whole break, it is
+/// skipped.
 pub struct Tracker {
     pub phase: Phase,
     pub work_remaining: Duration,
     pub break_accumulated: Duration,
     pub break_needed: Duration,
+    /// Standing time still required to finish the current break (the full
+    /// break minus the credit consumed when the break started).
+    pub break_requirement: Duration,
+    /// Voluntary standing time accrued during work; capped at `break_needed`
+    /// and consumed (or credited against) when the break starts.
+    pub standing_credit: Duration,
     /// Configured work block length (used when re-arming after a break).
     work_duration: Duration,
     pub paused: bool,
@@ -55,6 +68,8 @@ impl Tracker {
             work_duration: work_remaining,
             break_accumulated: Duration::ZERO,
             break_needed,
+            break_requirement: break_needed,
+            standing_credit: Duration::ZERO,
             paused: false,
         }
     }
@@ -67,6 +82,8 @@ impl Tracker {
         if self.phase != Phase::Idle {
             self.work_remaining = self.work_duration;
             self.break_accumulated = Duration::ZERO;
+            self.break_requirement = self.break_needed;
+            self.standing_credit = Duration::ZERO;
             self.phase = Phase::Working;
         }
     }
@@ -77,6 +94,8 @@ impl Tracker {
             self.phase = Phase::Working;
             self.work_remaining = self.work_duration;
             self.break_accumulated = Duration::ZERO;
+            self.break_requirement = self.break_needed;
+            self.standing_credit = Duration::ZERO;
             self.paused = false;
         }
     }
@@ -87,6 +106,8 @@ impl Tracker {
             self.phase = Phase::Idle;
             self.work_remaining = self.work_duration;
             self.break_accumulated = Duration::ZERO;
+            self.break_requirement = self.break_needed;
+            self.standing_credit = Duration::ZERO;
             self.paused = false;
         }
     }
@@ -99,9 +120,23 @@ impl Tracker {
         match self.phase {
             Phase::Idle => {}
             Phase::Working => {
+                // Voluntary time on your feet counts toward the next break
+                // (the break only needs the uncovered remainder).
+                if presence != Presence::Sitting {
+                    self.standing_credit = (self.standing_credit + dt).min(self.break_needed);
+                }
                 self.work_remaining = self.work_remaining.saturating_sub(dt);
                 if self.work_remaining.is_zero() {
+                    if self.standing_credit >= self.break_needed {
+                        // Already stood enough — skip the break entirely.
+                        self.phase = Phase::Working;
+                        self.work_remaining = self.work_duration;
+                        self.standing_credit = Duration::ZERO;
+                        return Some(TrackerEvent::BreakSkipped);
+                    }
                     self.phase = Phase::Break;
+                    self.break_requirement = self.break_needed.saturating_sub(self.standing_credit);
+                    self.standing_credit = Duration::ZERO;
                     self.break_accumulated = Duration::ZERO;
                     return Some(TrackerEvent::BreakStarted);
                 }
@@ -109,10 +144,12 @@ impl Tracker {
             Phase::Break => {
                 // Sitting at the desk -> break timer is PAUSED.
                 if presence != Presence::Sitting {
-                    self.break_accumulated = (self.break_accumulated + dt).min(self.break_needed);
-                    if self.break_accumulated >= self.break_needed {
+                    self.break_accumulated =
+                        (self.break_accumulated + dt).min(self.break_requirement);
+                    if self.break_accumulated >= self.break_requirement {
                         self.phase = Phase::Working;
                         self.work_remaining = self.work_duration;
+                        self.break_requirement = self.break_needed;
                         return Some(TrackerEvent::BreakCompleted);
                     }
                 }
@@ -130,6 +167,7 @@ impl Tracker {
         if self.phase == Phase::Break {
             self.phase = Phase::Working;
             self.work_remaining = self.work_duration;
+            self.break_requirement = self.break_needed;
         }
     }
 
@@ -137,6 +175,8 @@ impl Tracker {
         self.phase = Phase::Working;
         self.work_remaining = self.work_duration;
         self.break_accumulated = Duration::ZERO;
+        self.break_requirement = self.break_needed;
+        self.standing_credit = Duration::ZERO;
     }
 }
 
@@ -269,6 +309,115 @@ fn env_minutes(name: &str, default: f64) -> Duration {
 impl Default for Tracker {
     fn default() -> Self {
         Self::new(DEFAULT_WORK_MINUTES, DEFAULT_BREAK_MINUTES)
+    }
+}
+
+#[cfg(test)]
+mod tracker_tests {
+    use super::*;
+
+    const WORK: Duration = Duration::from_secs(6); // 0.1 min
+    const BREAK: Duration = Duration::from_secs(6);
+
+    fn started() -> Tracker {
+        let mut t = Tracker::new(WORK.as_secs_f64() / 60.0, BREAK.as_secs_f64() / 60.0);
+        t.clock_in();
+        t
+    }
+
+    #[test]
+    fn standing_during_work_accrues_credit() {
+        let mut t = started();
+        assert_eq!(t.tick(Duration::from_secs(2), Presence::Sitting), None);
+        assert_eq!(t.standing_credit, Duration::ZERO);
+        assert_eq!(t.tick(Duration::from_secs(3), Presence::Standing), None);
+        assert_eq!(t.standing_credit, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn credit_is_capped_at_break_needed() {
+        // Work block of 12s so the cap can be observed before it completes.
+        let mut t = Tracker::new(WORK.as_secs_f64() / 60.0 * 2.0, BREAK.as_secs_f64() / 60.0);
+        t.clock_in();
+        // 8s standing in a 12s block: credit caps at the 6s break.
+        assert_eq!(t.tick(Duration::from_secs(8), Presence::Standing), None);
+        assert_eq!(t.standing_credit, BREAK);
+    }
+
+    #[test]
+    fn credit_shortens_the_break() {
+        let mut t = started();
+        assert_eq!(t.tick(Duration::from_secs(3), Presence::Sitting), None);
+        // The second tick completes the work block (3+3=6s) -> the break
+        // starts, needing only the 3s not covered by standing credit.
+        assert!(matches!(
+            t.tick(Duration::from_secs(3), Presence::Standing),
+            Some(TrackerEvent::BreakStarted)
+        ));
+        // Credit was consumed when the break started (it is reflected in the
+        // reduced requirement below).
+        assert_eq!(t.standing_credit, Duration::ZERO);
+        assert_eq!(t.phase, Phase::Break);
+        assert_eq!(t.break_requirement, Duration::from_secs(3));
+        assert_eq!(t.standing_credit, Duration::ZERO); // consumed
+        // Sitting pauses the shortened break.
+        assert_eq!(t.tick(Duration::from_secs(10), Presence::Sitting), None);
+        assert_eq!(t.break_accumulated, Duration::ZERO);
+        // Standing completes it.
+        assert!(matches!(
+            t.tick(Duration::from_secs(3), Presence::Standing),
+            Some(TrackerEvent::BreakCompleted)
+        ));
+        assert_eq!(t.phase, Phase::Working);
+        assert_eq!(t.break_requirement, BREAK);
+    }
+
+    #[test]
+    fn full_credit_skips_the_break() {
+        let mut t = started();
+        // Standing for the whole 6s block covers the 6s break: the tick that
+        // completes the work fires BreakSkipped instead of BreakStarted.
+        assert!(matches!(
+            t.tick(Duration::from_secs(6), Presence::Standing),
+            Some(TrackerEvent::BreakSkipped)
+        ));
+        assert_eq!(t.phase, Phase::Working);
+        assert_eq!(t.standing_credit, Duration::ZERO);
+        assert_eq!(t.work_remaining, WORK);
+    }
+
+    #[test]
+    fn no_standing_keeps_the_full_break() {
+        let mut t = started();
+        assert!(matches!(t.tick(WORK, Presence::Sitting), Some(TrackerEvent::BreakStarted)));
+        assert_eq!(t.break_requirement, BREAK);
+        assert!(matches!(
+            t.tick(BREAK, Presence::Standing),
+            Some(TrackerEvent::BreakCompleted)
+        ));
+    }
+
+    #[test]
+    fn clock_out_during_break_ends_the_session() {
+        let mut t = started();
+        assert!(matches!(t.tick(WORK, Presence::Sitting), Some(TrackerEvent::BreakStarted)));
+        t.clock_out();
+        assert_eq!(t.phase, Phase::Idle);
+        // Nothing advances afterwards.
+        assert_eq!(t.tick(Duration::from_secs(60), Presence::Standing), None);
+        assert_eq!(t.phase, Phase::Idle);
+        assert_eq!(t.break_accumulated, Duration::ZERO);
+        assert_eq!(t.standing_credit, Duration::ZERO);
+        assert_eq!(t.break_requirement, BREAK);
+    }
+
+    #[test]
+    fn clock_out_resets_credit() {
+        let mut t = started();
+        assert_eq!(t.tick(Duration::from_secs(4), Presence::Standing), None);
+        assert_eq!(t.standing_credit, Duration::from_secs(4));
+        t.clock_out();
+        assert_eq!(t.standing_credit, Duration::ZERO);
     }
 }
 
