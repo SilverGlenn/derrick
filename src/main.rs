@@ -1174,8 +1174,9 @@ impl Render for AboutView {
                 .id(id)
                 .flex()
                 .w_full()
-                .justify_between()
+                .justify_center()
                 .items_center()
+                .gap_3()
                 .px_3()
                 .py_2()
                 .rounded_md()
@@ -1214,6 +1215,7 @@ impl Render for AboutView {
             div()
                 .flex()
                 .w_full()
+                .justify_center()
                 .items_center()
                 .px_3()
                 .py_2()
@@ -1230,9 +1232,9 @@ impl Render for AboutView {
             div()
                 .flex()
                 .w_full()
+                .justify_center()
                 .items_center()
-                .justify_between()
-                .gap_2()
+                .gap_4()
                 .child(text_el)
                 .child(button)
                 .into_any_element()
@@ -1243,11 +1245,17 @@ impl Render for AboutView {
         // The updates section varies with the phase.
         let updates_row: gpui::AnyElement = match &phase {
             UpdatePhase::Idle => {
-                action("about-check", "Check for updates", link)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.start_check();
-                        cx.notify();
-                    }))
+                div()
+                    .flex()
+                    .w_full()
+                    .justify_center()
+                    .child(
+                        action("about-check", "Check for updates", link)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.start_check();
+                                cx.notify();
+                            })),
+                    )
                     .into_any_element()
             }
             UpdatePhase::Checking => status_line("Checking for updates…".to_string()),
@@ -1404,6 +1412,7 @@ impl Render for AboutView {
                     .flex()
                     .flex_col()
                     .w_full()
+                    .items_center()
                     .gap_2()
                     .child(
                         div()
