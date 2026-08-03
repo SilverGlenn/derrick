@@ -572,7 +572,7 @@ fn open_about(state: &Entity<SergeantState>, app: &mut AsyncApp) {
         return;
     }
 
-    let bounds = app.update(|app| Bounds::centered(None, size(px(380.), px(400.)), app));
+    let bounds = app.update(|app| Bounds::centered(None, size(px(380.), px(380.)), app));
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: None,
@@ -1168,33 +1168,21 @@ impl Render for AboutView {
                 }))
         };
 
-        // Full-width link row for the repo.
-        let link_row = |id: &'static str, url: &'static str, label: &'static str| {
-            div()
-                .id(id)
-                .flex()
-                .w_full()
-                .justify_center()
-                .items_center()
-                .gap_3()
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .text_sm()
-                .cursor_pointer()
-                .hover(|style| style.bg(rgb(0x2a2a3a)))
-                .child(div().text_color(text).child(label))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(dim)
-                        .child(url.trim_start_matches("https://")),
-                )
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    open_url(url);
-                    cx.notify();
-                }))
-        };
+        // Clickable GitHub mark (opens the repo in the browser).
+        let github_icon = div()
+            .id("about-github")
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_2()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(0x2a2a3a)))
+            .child(img(ImageSource::Render(github_icon())).size(px(28.)))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                open_url(GITHUB_URL);
+                cx.notify();
+            }));
 
         // A compact action button (sage = primary action, teal = secondary).
         let action = |id: &'static str, label: &'static str, color: gpui::Rgba| {
@@ -1404,8 +1392,8 @@ impl Render for AboutView {
                             )),
                     ),
             )
-            // Repo link.
-            .child(link_row("about-github", GITHUB_URL, "GitHub repository"))
+            // Repo link: clickable GitHub mark.
+            .child(github_icon)
             // Updates: check, download, install.
             .child(
                 div()
@@ -1457,6 +1445,33 @@ impl Render for AboutView {
                     ),
             )
     }
+}
+
+/// The GitHub mark, tinted to the link color, for the About window.
+fn github_icon() -> Arc<RenderImage> {
+    use std::sync::OnceLock;
+    static ICON: OnceLock<Arc<RenderImage>> = OnceLock::new();
+    ICON.get_or_init(|| {
+        let png = include_bytes!("../assets/github.png");
+        let mut img = image::load_from_memory(png)
+            .expect("github mark png")
+            .to_rgba8();
+        // The official mark is black; tint non-transparent pixels to the
+        // link teal so it reads on the dark background.
+        for px in img.pixels_mut() {
+            if px[3] > 0 {
+                px[0] = 0x86;
+                px[1] = 0xBC;
+                px[2] = 0xBD;
+            }
+        }
+        let (w, h) = img.dimensions();
+        let buffer = RgbaImage::from_raw(w, h, img.into_raw()).expect("rgba buffer");
+        Arc::new(RenderImage::new(
+            std::iter::once(Frame::new(buffer)).collect::<smallvec::SmallVec<[Frame; 1]>>(),
+        ))
+    })
+    .clone()
 }
 
 /// The app icon (same orange figure as the tray) for the About window.
